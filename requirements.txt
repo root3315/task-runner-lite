@@ -1,0 +1,3 @@
+# task-runner-lite requires no external dependencies.
+# All functionality uses the Python standard library.
+# Minimum Python version: 3.8
