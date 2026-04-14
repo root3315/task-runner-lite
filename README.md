@@ -110,7 +110,7 @@ python task_runner.py --version
 | `--no-cache`     | Disable result caching                   |
 | `--clear-cache`  | Clear all cached results and exit        |
 | `--keep-going`   | Continue after task failures             |
-| `-v, --verbose`  | Show verbose output                      |
+| `-v, --verbose`  | Show detailed output (discovery, commands, full stdout/stderr, cache status) |
 | `--version`      | Show version and exit                    |
 
 ## Task Definition API

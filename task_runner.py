@@ -60,21 +60,28 @@ class TaskResult:
 
 # --- Task Discovery ---
 
-def discover_tasks_from_dir(directory: Path) -> List[Task]:
+def discover_tasks_from_dir(directory: Path, verbose: bool = False) -> List[Task]:
     """Discover tasks from executable scripts in a directory."""
     tasks = []
     if not directory.exists():
+        if verbose:
+            print(f"  [verbose] {directory}/ does not exist, skipping")
         return tasks
+
+    if verbose:
+        print(f"  [verbose] Scanning {directory}/ for tasks")
 
     for entry in sorted(directory.iterdir()):
         if entry.is_file() and os.access(entry, os.X_OK):
             task = Task(
                 name=entry.stem,
-                command=str(entry),
+                command=f"./{entry.name}",
                 description=f"Run {entry.name}",
                 cwd=str(entry.parent),
             )
             tasks.append(task)
+            if verbose:
+                print(f"  [verbose] Found task '{task.name}' (executable: {entry.name})")
         elif entry.is_file() and entry.suffix in (".py", ".sh", ".js"):
             cmd = _build_command(entry)
             if cmd:
@@ -85,27 +92,36 @@ def discover_tasks_from_dir(directory: Path) -> List[Task]:
                     cwd=str(entry.parent),
                 )
                 tasks.append(task)
+                if verbose:
+                    print(f"  [verbose] Found task '{task.name}' (script: {entry.name}, runner: {cmd.split()[0]})")
     return tasks
 
 
 def _build_command(entry: Path) -> Optional[str]:
     """Build a command to execute a script file."""
     if entry.suffix == ".py":
-        return f"{sys.executable} {entry}"
+        return f"{sys.executable} ./{entry.name}"
     elif entry.suffix == ".sh":
-        return f"bash {entry}"
+        return f"bash ./{entry.name}"
     elif entry.suffix == ".js":
-        return f"node {entry}"
+        return f"node ./{entry.name}"
     return None
 
 
-def discover_tasks_from_module(filepath: Path) -> List[Task]:
+def discover_tasks_from_module(filepath: Path, verbose: bool = False) -> List[Task]:
     """Discover tasks from a Python module (Tasksfile.py)."""
     if not filepath.exists():
+        if verbose:
+            print(f"  [verbose] {filepath} does not exist, skipping")
         return []
+
+    if verbose:
+        print(f"  [verbose] Loading tasks from {filepath}")
 
     spec = importlib.util.spec_from_file_location("tasksfile", filepath)
     if spec is None or spec.loader is None:
+        if verbose:
+            print(f"  [verbose] Failed to load {filepath}")
         return []
 
     module = importlib.util.module_from_spec(spec)
@@ -120,6 +136,8 @@ def discover_tasks_from_module(filepath: Path) -> List[Task]:
             if attr.name == "":
                 attr.name = attr_name
             tasks.append(attr)
+            if verbose:
+                print(f"  [verbose] Found task '{attr.name}' (Task object)")
         elif callable(attr) and hasattr(attr, "_task_meta"):
             meta = attr._task_meta
             task = Task(
@@ -132,6 +150,8 @@ def discover_tasks_from_module(filepath: Path) -> List[Task]:
                 retries=meta.get("retries", 0),
             )
             tasks.append(task)
+            if verbose:
+                print(f"  [verbose] Found task '{task.name}' (decorated function)")
     return tasks
 
 
@@ -154,7 +174,7 @@ def task(name: str = "", description: str = "", depends: Optional[List[str]] = N
 
 # --- Dependency Resolution ---
 
-def resolve_execution_order(tasks: List[Task], targets: Optional[List[str]] = None) -> List[List[str]]:
+def resolve_execution_order(tasks: List[Task], targets: Optional[List[str]] = None, verbose: bool = False) -> List[List[str]]:
     """
     Resolve task execution order using topological sort.
     Returns list of levels, where tasks in the same level can run in parallel.
@@ -162,6 +182,8 @@ def resolve_execution_order(tasks: List[Task], targets: Optional[List[str]] = No
     task_map = {t.name: t for t in tasks}
 
     if targets:
+        if verbose:
+            print(f"  [verbose] Targeted tasks: {', '.join(targets)}")
         required = set()
         for target in targets:
             _collect_deps(target, task_map, required)
@@ -195,6 +217,10 @@ def resolve_execution_order(tasks: List[Task], targets: Optional[List[str]] = No
             for dep_name in dependents.get(name, []):
                 if dep_name in remaining:
                     remaining[dep_name] -= 1
+
+    if verbose:
+        for i, level in enumerate(levels):
+            print(f"  [verbose] Stage {i + 1}: {', '.join(level)}")
 
     return levels
 
@@ -238,13 +264,22 @@ def _find_cycle(remaining: Dict[str, int], dependents: Dict[str, List[str]]) -> 
 
 # --- Task Execution ---
 
-def run_single_task(task: Task, cache_enabled: bool = False) -> TaskResult:
+def run_single_task(task: Task, cache_enabled: bool = False, verbose: bool = False) -> TaskResult:
     """Execute a single task and return the result."""
     if cache_enabled and _is_cache_valid(task):
+        if verbose:
+            print(f"  [verbose] Task '{task.name}': cache hit, skipping execution")
         return TaskResult(
             name=task.name, success=True, exit_code=0,
             duration=0.0, stdout="(cached)", stderr="", cached=True,
         )
+
+    if verbose:
+        print(f"  [verbose] Task '{task.name}': running command: {task.command}")
+        if task.cwd:
+            print(f"  [verbose] Task '{task.name}': working directory: {task.cwd}")
+        if task.env:
+            print(f"  [verbose] Task '{task.name}': extra env vars: {task.env}")
 
     start_time = time.time()
     env = os.environ.copy()
@@ -272,25 +307,45 @@ def run_single_task(task: Task, cache_enabled: bool = False) -> TaskResult:
             stderr=result.stderr.strip(),
         )
 
+        if verbose:
+            print(f"  [verbose] Task '{task.name}': exit code {task_result.exit_code} in {task_result.duration:.2f}s")
+            if task_result.stdout:
+                print(f"  [verbose] Task '{task.name}' stdout:")
+                for line in task_result.stdout.split("\n"):
+                    print(f"    {line}")
+            if task_result.stderr:
+                label = "stderr" if not task_result.success else "stdout+stderr"
+                print(f"  [verbose] Task '{task.name}' {label}:")
+                for line in task_result.stderr.split("\n"):
+                    print(f"    {line}")
+
         if task_result.success and cache_enabled:
             _save_cache(task, task_result)
+            if verbose:
+                print(f"  [verbose] Task '{task.name}': result cached")
 
         return task_result
 
     except subprocess.TimeoutExpired:
         duration = time.time() - start_time
+        if verbose:
+            print(f"  [verbose] Task '{task.name}': timed out after {duration:.2f}s")
         return TaskResult(
             name=task.name, success=False, exit_code=124,
             duration=duration, stdout="", stderr="Task timed out (300s)",
         )
     except FileNotFoundError as e:
         duration = time.time() - start_time
+        if verbose:
+            print(f"  [verbose] Task '{task.name}': command not found: {e}")
         return TaskResult(
             name=task.name, success=False, exit_code=127,
             duration=duration, stdout="", stderr=f"Command not found: {e}",
         )
     except Exception as e:
         duration = time.time() - start_time
+        if verbose:
+            print(f"  [verbose] Task '{task.name}': error: {e}")
         return TaskResult(
             name=task.name, success=False, exit_code=1,
             duration=duration, stdout="", stderr=str(e),
@@ -315,24 +370,34 @@ def _compute_task_hash(task: Task) -> str:
     return h.hexdigest()
 
 
-def _is_cache_valid(task: Task) -> bool:
+def _is_cache_valid(task: Task, verbose: bool = False) -> bool:
     """Check if a cached result is still valid."""
     cache_file = CACHE_DIR / f"{task.name}.json"
     if not cache_file.exists():
+        if verbose:
+            print(f"  [verbose] Task '{task.name}': no cache file at {cache_file}")
         return False
 
     try:
         data = json.loads(cache_file.read_text())
         current_hash = _compute_task_hash(task)
         if data.get("hash") != current_hash:
+            if verbose:
+                print(f"  [verbose] Task '{task.name}': cache hash mismatch")
             return False
 
         for output in task.outputs:
             if not Path(output).exists():
+                if verbose:
+                    print(f"  [verbose] Task '{task.name}': output '{output}' missing, cache invalid")
                 return False
 
+        if verbose:
+            print(f"  [verbose] Task '{task.name}': cache valid")
         return True
     except (json.JSONDecodeError, KeyError):
+        if verbose:
+            print(f"  [verbose] Task '{task.name}': cache file corrupted")
         return False
 
 
@@ -365,6 +430,7 @@ def execute_tasks_parallel(
     workers: int = DEFAULT_WORKERS,
     cache: bool = False,
     stop_on_failure: bool = True,
+    verbose: bool = False,
 ) -> List[TaskResult]:
     """Execute tasks in parallel respecting dependency levels."""
     task_map = {t.name: t for t in tasks}
@@ -383,7 +449,7 @@ def execute_tasks_parallel(
         print(f"Stage {level_idx + 1}/{len(levels)}: {', '.join(level)}")
         print(f"{'='*60}")
 
-        level_results = _run_level(level_tasks, workers, cache)
+        level_results = _run_level(level_tasks, workers, cache, verbose)
 
         for result in level_results:
             all_results.append(result)
@@ -395,29 +461,32 @@ def execute_tasks_parallel(
     return all_results
 
 
-def _run_level(tasks: List[Task], workers: int, cache: bool) -> List[TaskResult]:
+def _run_level(tasks: List[Task], workers: int, cache: bool, verbose: bool) -> List[TaskResult]:
     """Run a single level of tasks in parallel."""
     results = []
 
     with ThreadPoolExecutor(max_workers=min(workers, len(tasks))) as executor:
         futures = {
-            executor.submit(run_single_task, task, cache): task
+            executor.submit(run_single_task, task, cache, verbose): task
             for task in tasks
         }
 
         for future in as_completed(futures):
             result = future.result()
             results.append(result)
-            _print_result(result)
+            _print_result(result, verbose)
 
     return results
 
 
-def _print_result(result: TaskResult):
+def _print_result(result: TaskResult, verbose: bool = False):
     """Print a formatted task result."""
     status = "OK" if result.success else "FAIL"
     cache_tag = " [cached]" if result.cached else ""
     print(f"  [{status}] {result.name}{cache_tag} ({result.duration:.2f}s)")
+
+    if verbose:
+        return  # verbose already prints full output
 
     if result.stdout:
         for line in result.stdout.split("\n")[:5]:
@@ -429,7 +498,7 @@ def _print_result(result: TaskResult):
 
 # --- Reporting ---
 
-def print_summary(results: List[TaskResult]):
+def print_summary(results: List[TaskResult], verbose: bool = False):
     """Print execution summary."""
     total = len(results)
     passed = sum(1 for r in results if r.success)
@@ -445,6 +514,14 @@ def print_summary(results: List[TaskResult]):
     print(f"  Failed:   {failed}")
     print(f"  Cached:   {cached}")
     print(f"  Duration: {total_duration:.2f}s")
+
+    if verbose:
+        print(f"\n  Per-task details:")
+        for r in results:
+            status = "OK" if r.success else "FAIL"
+            cache_info = " (cached)" if r.cached else ""
+            print(f"    [{status}] {r.name}{cache_info}: {r.duration:.2f}s, exit code {r.exit_code}")
+
     print(f"{'='*60}")
 
 
@@ -521,8 +598,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Discover tasks
     all_tasks: List[Task] = []
-    all_tasks.extend(discover_tasks_from_module(TASKSFILE))
-    all_tasks.extend(discover_tasks_from_dir(TASKS_DIR))
+    all_tasks.extend(discover_tasks_from_module(TASKSFILE, verbose=args.verbose))
+    all_tasks.extend(discover_tasks_from_dir(TASKS_DIR, verbose=args.verbose))
 
     if args.list:
         cmd_list_tasks(all_tasks)
@@ -533,8 +610,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"Create a {TASKSFILE} or add scripts to {TASKS_DIR}/", file=sys.stderr)
         return 1
 
+    if args.verbose:
+        print(f"  [verbose] Discovered {len(all_tasks)} task(s): {', '.join(t.name for t in all_tasks)}")
+
     # Resolve execution order
-    levels = resolve_execution_order(all_tasks, args.tasks)
+    levels = resolve_execution_order(all_tasks, args.tasks, verbose=args.verbose)
     flat_names = [name for level in levels for name in level]
 
     if args.tasks:
@@ -550,10 +630,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         workers=args.workers,
         cache=cache_enabled,
         stop_on_failure=not args.keep_going,
+        verbose=args.verbose,
     )
 
     # Report
-    print_summary(results)
+    print_summary(results, verbose=args.verbose)
 
     failed = [r for r in results if not r.success]
     return 1 if failed else 0
